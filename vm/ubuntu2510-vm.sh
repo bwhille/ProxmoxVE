@@ -4,7 +4,18 @@
 # Author: HLTRP
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
-source /dev/stdin <<<$(curl -fsSL "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func")
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+API_FUNC_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/9f3588dd8d2c1aa24ea52d53b71e8c70dc81eb2c/misc/api.func"
+API_FUNC_FILE="$(mktemp)"
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "${API_FUNC_URL}" -o "${API_FUNC_FILE}"
+[[ -s "${API_FUNC_FILE}" ]] || {
+  echo "Failed to download api.func from ${API_FUNC_URL}" >&2
+  exit 1
+}
+source "${API_FUNC_FILE}"
+rm -f "${API_FUNC_FILE}"
 
 function header_info {
   clear
@@ -20,22 +31,20 @@ EOF
 header_info
 echo -e "\n Loading..."
 GEN_MAC=02:$(openssl rand -hex 5 | awk '{print toupper($0)}' | sed 's/\(..\)/\1:/g; s/.$//')
-RANDOM_UUID="$(cat /proc/sys/kernel/random/uuid)"
+RANDOM_UUID="$(< /proc/sys/kernel/random/uuid)"
 METHOD=""
 NSAPP="ubuntu-2510-vm"
 var_os="ubuntu"
 var_version="2510"
 
-YW=$(echo "\033[33m")
-BL=$(echo "\033[36m")
-RD=$(echo "\033[01;31m")
-BGN=$(echo "\033[4;92m")
-GN=$(echo "\033[1;92m")
-DGN=$(echo "\033[32m")
-CL=$(echo "\033[m")
-
-CL=$(echo "\033[m")
-BOLD=$(echo "\033[1m")
+YW="$(printf '\033[33m')"
+BL="$(printf '\033[36m')"
+RD="$(printf '\033[01;31m')"
+BGN="$(printf '\033[4;92m')"
+GN="$(printf '\033[1;92m')"
+DGN="$(printf '\033[32m')"
+CL="$(printf '\033[m')"
+BOLD="$(printf '\033[1m')"
 BFR='\r\033[K'
 HOLD=" "
 TAB="  "
@@ -59,19 +68,48 @@ CREATING="${TAB}🚀${TAB}${CL}"
 ADVANCED="${TAB}🧩${TAB}${CL}"
 
 THIN="discard=on,ssd=1,"
-set -e
+WORKDIR_PUSHED="0"
 trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
 trap cleanup EXIT
-trap 'post_update_to_api "failed" "INTERRUPTED"' SIGINT
-trap 'post_update_to_api "failed" "TERMINATED"' SIGTERM
+trap 'on_signal "INTERRUPTED"' SIGINT
+trap 'on_signal "TERMINATED"' SIGTERM
 function error_handler() {
+  trap - ERR
   local exit_code="$?"
-  local line_number="$1"
-  local command="$2"
-  post_update_to_api "failed" "${exit_code}"
+  local line_number="${1:-unknown}"
+  local command="${2:-unknown}"
+  post_update_to_api "failed" "${exit_code}" || true
   local error_message="${RD}[ERROR]${CL} in line ${RD}${line_number}${CL}: exit code ${RD}${exit_code}${CL}: while executing command ${YW}${command}${CL}"
   echo -e "\n${error_message}\n"
-  cleanup_vmid
+  cleanup_vmid || true
+  exit "${exit_code}"
+}
+
+function on_signal() {
+  local reason="$1"
+  post_update_to_api "failed" "${reason}" || true
+  cleanup_vmid || true
+  exit 130
+}
+
+function check_dependencies() {
+  local missing=()
+  local binary
+  for binary in awk curl dpkg flock grep numfmt openssl pvesh pvesm qm sed sha256sum tr whiptail; do
+    if ! command -v "${binary}" >/dev/null 2>&1; then
+      missing+=("${binary}")
+    fi
+  done
+
+  if ! command -v lvs >/dev/null 2>&1; then
+    msg_error "Missing dependency: lvs (lvm2 package)"
+    exit 1
+  fi
+
+  if ((${#missing[@]} > 0)); then
+    msg_error "Missing dependencies: ${missing[*]}"
+    exit 1
+  fi
 }
 
 function get_valid_nextid() {
@@ -92,19 +130,27 @@ function get_valid_nextid() {
 }
 
 function cleanup_vmid() {
-  if qm status "${VMID}" &>/dev/null; then
+  if [[ -n "${VMID:-}" ]] && qm status "${VMID}" &>/dev/null; then
     qm stop "${VMID}" &>/dev/null
     qm destroy "${VMID}" &>/dev/null
   fi
 }
 
 function cleanup() {
-  popd >/dev/null
-  rm -rf "${TEMP_DIR}"
+  if [[ "${WORKDIR_PUSHED}" == "1" ]]; then
+    popd >/dev/null || true
+  fi
+  if [[ -n "${API_FUNC_FILE:-}" && -f "${API_FUNC_FILE}" ]]; then
+    rm -f "${API_FUNC_FILE}"
+  fi
+  if [[ -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+    rm -rf "${TEMP_DIR}"
+  fi
 }
 
 TEMP_DIR=$(mktemp -d)
 pushd "${TEMP_DIR}" >/dev/null
+WORKDIR_PUSHED="1"
 if whiptail --backtitle "Proxmox VE Helper Scripts" --title "Ubuntu 25.10 VM" --yesno "This will create a New Ubuntu 25.10 VM. Proceed?" 10 58; then
   :
 else
@@ -127,7 +173,7 @@ function msg_error() {
 }
 
 function check_root() {
-  if [[ "$(id -u)" -ne 0 || $(ps -o comm= -p "${PPID}") == "sudo" ]]; then
+  if [[ "$(id -u)" -ne 0 ]]; then
     clear
     msg_error "Please run this script as root."
     echo -e "\nExiting..."
@@ -172,8 +218,8 @@ pve_check() {
 
 function arch_check() {
   if [[ "$(dpkg --print-architecture)" != "amd64" ]]; then
-    echo -e "\n ${INFO}${YWB}This script will not work with PiMox! \n"
-    echo -e "\n ${YWB}Visit https://github.com/asylumexp/Proxmox for ARM64 support. \n"
+    echo -e "\n ${INFO}${YW}This script will not work with PiMox! \n"
+    echo -e "\n ${YW}Visit https://github.com/asylumexp/Proxmox for ARM64 support. \n"
     echo -e "Exiting..."
     sleep 2
     exit
@@ -200,7 +246,10 @@ function exit-script() {
 }
 
 function default_settings() {
+  exec 9>/var/lock/proxmox-ubuntu2510-vm.lock
+  flock -x 9
   VMID=$(get_valid_nextid)
+  flock -u 9
   FORMAT=",efitype=4m"
   MACHINE=""
   DISK_SIZE="7G"
@@ -239,6 +288,11 @@ function advanced_settings() {
       if [[ -z "${VMID}" ]]; then
         VMID=$(get_valid_nextid)
       fi
+      if ! [[ "${VMID}" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${CROSS}${RD} ID must be a positive integer${CL}"
+        sleep 2
+        continue
+      fi
       if pct status "${VMID}" &>/dev/null || qm status "${VMID}" &>/dev/null; then
         echo -e "${CROSS}${RD} ID ${VMID} is already in use${CL}"
         sleep 2
@@ -268,7 +322,7 @@ function advanced_settings() {
     exit-script
   fi
 
-  if DISK_SIZE=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Set Disk Size in GiB (e.g., 10, 20)" 8 58 "${DISK_SIZE}" --title "DISK SIZE" --cancel-button Exit-Script 3>&1 1>&2 2>&3); then
+  if DISK_SIZE=$(whiptail --backtitle "Proxmox VE Helper Scripts" --inputbox "Set Disk Size in GiB (e.g., 10, 20)" 8 58 "${DISK_SIZE:-7G}" --title "DISK SIZE" --cancel-button Exit-Script 3>&1 1>&2 2>&3); then
     DISK_SIZE=$(echo "${DISK_SIZE}" | tr -d ' ')
     if [[ ${DISK_SIZE} =~ ^[0-9]+$ ]]; then
       DISK_SIZE="${DISK_SIZE}G"
@@ -304,6 +358,10 @@ function advanced_settings() {
       echo -e "${HOSTNAME}${BOLD}${DGN}Hostname: ${BGN}${HN}${CL}"
     else
       HN=$(echo "${VM_NAME,,}" | tr -d ' ')
+      if ! [[ "${HN}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+        msg_error "Invalid hostname. Use letters, numbers and dashes only."
+        exit-script
+      fi
       echo -e "${HOSTNAME}${BOLD}${DGN}Hostname: ${BGN}${HN}${CL}"
     fi
   else
@@ -330,6 +388,10 @@ function advanced_settings() {
       CORE_COUNT="2"
       echo -e "${CPUCORE}${BOLD}${DGN}CPU Cores: ${BGN}${CORE_COUNT}${CL}"
     else
+      if ! [[ "${CORE_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "Invalid CPU core count."
+        exit-script
+      fi
       echo -e "${CPUCORE}${BOLD}${DGN}CPU Cores: ${BGN}${CORE_COUNT}${CL}"
     fi
   else
@@ -341,6 +403,10 @@ function advanced_settings() {
       RAM_SIZE="2048"
       echo -e "${RAMSIZE}${BOLD}${DGN}RAM Size: ${BGN}${RAM_SIZE}${CL}"
     else
+      if ! [[ "${RAM_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+        msg_error "Invalid RAM size."
+        exit-script
+      fi
       echo -e "${RAMSIZE}${BOLD}${DGN}RAM Size: ${BGN}${RAM_SIZE}${CL}"
     fi
   else
@@ -352,6 +418,10 @@ function advanced_settings() {
       BRG="vmbr0"
       echo -e "${BRIDGE}${BOLD}${DGN}Bridge: ${BGN}${BRG}${CL}"
     else
+      if ! [[ "${BRG}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+        msg_error "Invalid bridge value."
+        exit-script
+      fi
       echo -e "${BRIDGE}${BOLD}${DGN}Bridge: ${BGN}${BRG}${CL}"
     fi
   else
@@ -363,6 +433,10 @@ function advanced_settings() {
       MAC="${GEN_MAC}"
       echo -e "${MACADDRESS}${BOLD}${DGN}MAC Address: ${BGN}${MAC}${CL}"
     else
+      if ! [[ "${MAC1}" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+        msg_error "Invalid MAC address."
+        exit-script
+      fi
       MAC="${MAC1}"
       echo -e "${MACADDRESS}${BOLD}${DGN}MAC Address: ${BGN}${MAC1}${CL}"
     fi
@@ -376,6 +450,10 @@ function advanced_settings() {
       VLAN=""
       echo -e "${VLANTAG}${BOLD}${DGN}VLAN: ${BGN}${VLAN1}${CL}"
     else
+      if ! [[ "${VLAN1}" =~ ^[0-9]+$ ]] || ((VLAN1 < 1 || VLAN1 > 4094)); then
+        msg_error "Invalid VLAN tag. Allowed range: 1-4094."
+        exit-script
+      fi
       VLAN=",tag=${VLAN1}"
       echo -e "${VLANTAG}${BOLD}${DGN}VLAN: ${BGN}${VLAN1}${CL}"
     fi
@@ -389,6 +467,10 @@ function advanced_settings() {
       MTU=""
       echo -e "${DEFAULT}${BOLD}${DGN}Interface MTU Size: ${BGN}${MTU1}${CL}"
     else
+      if ! [[ "${MTU1}" =~ ^[0-9]+$ ]] || ((MTU1 < 576 || MTU1 > 9216)); then
+        msg_error "Invalid MTU. Allowed range: 576-9216."
+        exit-script
+      fi
       MTU=",mtu=${MTU1}"
       echo -e "${DEFAULT}${BOLD}${DGN}Interface MTU Size: ${BGN}${MTU1}${CL}"
     fi
@@ -425,6 +507,7 @@ function start_script() {
   fi
 }
 check_root
+check_dependencies
 arch_check
 pve_check
 ssh_check
@@ -432,10 +515,11 @@ start_script
 post_to_api_vm
 
 msg_info "Validating Storage"
+pvesm status -content images >/dev/null
 while read -r line; do
-  TAG=$(echo "${line}" | awk '{print $1}')
-  TYPE=$(echo "${line}" | awk '{printf "%-10s", $2}')
-  FREE=$(echo "${line}" | numfmt --field 4-6 --from-unit=K --to=iec --format %.2f | awk '{printf( "%9sB", $6)}')
+  TAG=$(awk '{print $1}' <<<"${line}")
+  TYPE=$(awk '{printf "%-10s", $2}' <<<"${line}")
+  FREE=$(numfmt --field 4-6 --from-unit=K --to=iec --format %.2f <<<"${line}" | awk '{printf("%9sB", $6)}')
   ITEM="  Type: ${TYPE} Free: ${FREE} "
   OFFSET=2
   if [[ $((${#ITEM} + OFFSET)) -gt ${MSG_MAX_LENGTH-} ]]; then
@@ -451,10 +535,12 @@ elif [[ $((${#STORAGE_MENU[@]} / 3)) -eq 1 ]]; then
   STORAGE=${STORAGE_MENU[0]}
 else
   while [[ -z "${STORAGE:+x}" ]]; do
-    STORAGE=$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "Storage Pools" --radiolist \
+    if ! STORAGE=$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "Storage Pools" --radiolist \
       "Which storage pool would you like to use for ${HN}?\nTo make a selection, use the Spacebar.\n" \
       16 $((MSG_MAX_LENGTH + 23)) 6 \
-      "${STORAGE_MENU[@]}" 3>&1 1>&2 2>&3)
+      "${STORAGE_MENU[@]}" 3>&1 1>&2 2>&3); then
+      exit-script
+    fi
   done
 fi
 msg_ok "Using ${CL}${BL}${STORAGE}${CL} ${GN}for Storage Location."
@@ -463,10 +549,14 @@ msg_info "Retrieving the URL for the Ubuntu 25.10 Disk Image"
 URL=https://cloud-images.ubuntu.com/releases/25.10/release/ubuntu-25.10-server-cloudimg-amd64.img
 sleep 2
 msg_ok "${CL}${BL}${URL}${CL}"
-curl -f#SL -o "$(basename "${URL}")" "${URL}"
+curl --proto '=https' --tlsv1.2 -f#SL -o "$(basename "${URL}")" "${URL}"
 echo -en "\e[1A\e[0K"
 FILE=$(basename "${URL}")
 msg_ok "Downloaded ${CL}${BL}${FILE}${CL}"
+msg_info "Verifying Ubuntu image checksum"
+curl --proto '=https' --tlsv1.2 -fsSLO "https://cloud-images.ubuntu.com/releases/25.10/release/SHA256SUMS"
+grep " ${FILE}\$" SHA256SUMS | sha256sum -c - >/dev/null
+msg_ok "Checksum verified for ${CL}${BL}${FILE}${CL}"
 
 STORAGE_TYPE=$(pvesm status -storage "${STORAGE}" | awk 'NR>1 {print $2}')
 case ${STORAGE_TYPE} in
@@ -489,15 +579,30 @@ btrfs)
   DISK_IMPORT_FORMAT="raw"
   ;;
 esac
-for i in {0,1}; do
-  disk="DISK${i}"
-  eval DISK"${i}"=vm-"${VMID}"-disk-"${i}""${DISK_EXT-}"
-  eval DISK"${i}"_REF="${STORAGE}":"${DISK_REF-}""${!disk}"
-done
+DISK0="vm-${VMID}-disk-0${DISK_EXT-}"
+DISK1="vm-${VMID}-disk-1${DISK_EXT-}"
+DISK0_REF="${STORAGE}:${DISK_REF-}${DISK0}"
+DISK1_REF="${STORAGE}:${DISK_REF-}${DISK1}"
 
 msg_info "Creating a Ubuntu 25.10 VM"
-qm create "${VMID}" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "${CORE_COUNT}" -memory "${RAM_SIZE}" \
-  -name "${HN}" -tags community-script -net0 virtio,bridge="${BRG}",macaddr="${MAC}""${VLAN}""${MTU}" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
+exec 9>/var/lock/proxmox-ubuntu2510-vm.lock
+flock -x 9
+if qm status "${VMID}" &>/dev/null; then
+  msg_error "VMID ${VMID} is already in use."
+  flock -u 9
+  exit 1
+fi
+EXTRA_QM_ARGS=()
+if [[ "${MACHINE:-}" == " -machine q35" ]]; then
+  EXTRA_QM_ARGS+=(-machine q35)
+fi
+if [[ "${CPU_TYPE:-}" == " -cpu host" ]]; then
+  EXTRA_QM_ARGS+=(-cpu host)
+fi
+qm create "${VMID}" -agent 1 -tablet 0 -localtime 1 -bios ovmf -cores "${CORE_COUNT}" -memory "${RAM_SIZE}" \
+  -name "${HN}" -tags community-script -net0 "virtio,bridge=${BRG},macaddr=${MAC}${VLAN}${MTU}" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci \
+  "${EXTRA_QM_ARGS[@]}"
+flock -u 9
 pvesm alloc "${STORAGE}" "${VMID}" "${DISK0}" 4M 1>&/dev/null
 qm importdisk "${VMID}" "${FILE}" "${STORAGE}" --format "${DISK_IMPORT_FORMAT}" 1>&/dev/null
 qm set "${VMID}" \
@@ -537,12 +642,9 @@ DESCRIPTION=$(
 EOF
 )
 qm set "${VMID}" -description "${DESCRIPTION}" >/dev/null
-if [[ -n "${DISK_SIZE}" ]]; then
+if [[ -n "${DISK_SIZE:-}" ]]; then
   msg_info "Resizing disk to ${DISK_SIZE} GB"
   qm resize "${VMID}" scsi0 "${DISK_SIZE}" >/dev/null
-else
-  msg_info "Using default disk size of ${DEFAULT_DISK_SIZE} GB"
-  qm resize "${VMID}" scsi0 "${DEFAULT_DISK_SIZE}" >/dev/null
 fi
 
 msg_ok "Created a Ubuntu 25.10 VM ${CL}${BL}(${HN})"
