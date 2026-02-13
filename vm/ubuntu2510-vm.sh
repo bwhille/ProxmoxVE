@@ -473,20 +473,20 @@ case $STORAGE_TYPE in
 nfs | dir | cifs)
   DISK_EXT=".qcow2"
   DISK_REF="$VMID/"
-  DISK_IMPORT="--format qcow2"
+  DISK_IMPORT_FORMAT="qcow2"
   THIN=""
   ;;
 btrfs)
   DISK_EXT=".raw"
   DISK_REF="$VMID/"
-  DISK_IMPORT="--format raw"
+  DISK_IMPORT_FORMAT="raw"
   FORMAT=",efitype=4m"
   THIN=""
   ;;
 *)
   DISK_EXT=""
   DISK_REF=""
-  DISK_IMPORT="--format raw"
+  DISK_IMPORT_FORMAT="raw"
   ;;
 esac
 for i in {0,1}; do
@@ -499,7 +499,7 @@ msg_info "Creating a Ubuntu 25.10 VM"
 qm create "$VMID" -agent 1"${MACHINE}" -tablet 0 -localtime 1 -bios ovmf"${CPU_TYPE}" -cores "$CORE_COUNT" -memory "$RAM_SIZE" \
   -name "$HN" -tags community-script -net0 virtio,bridge="$BRG",macaddr="$MAC""$VLAN""$MTU" -onboot 1 -ostype l26 -scsihw virtio-scsi-pci
 pvesm alloc "$STORAGE" "$VMID" "$DISK0" 4M 1>&/dev/null
-qm importdisk "$VMID" "${FILE}" "$STORAGE" "${DISK_IMPORT}" 1>&/dev/null
+qm importdisk "$VMID" "${FILE}" "$STORAGE" --format "$DISK_IMPORT_FORMAT" 1>&/dev/null
 qm set "$VMID" \
   -efidisk0 "${DISK0_REF}"${FORMAT} \
   -scsi0 "${DISK1_REF}",${DISK_CACHE}${THIN}size="${DISK_SIZE}" \
